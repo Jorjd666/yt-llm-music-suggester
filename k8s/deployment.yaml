@@ -1,0 +1,45 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yt-llm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: yt-llm
+  template:
+    metadata:
+      labels:
+        app: yt-llm
+    spec:
+      containers:
+        - name: api
+          image: your-repo/yt-llm-music-suggester:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: yt-llm-config
+            - secretRef:
+                name: yt-llm-secrets
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

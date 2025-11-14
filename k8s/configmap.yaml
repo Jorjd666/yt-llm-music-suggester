@@ -1,0 +1,12 @@
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: yt-llm-config
+data:
+  OPENAI_MODEL: "gpt-4o-mini"
+  MAX_YT_RESULTS: "25"
+  MAX_SUGGESTIONS: "10"
+  REQUESTS_TIMEOUT: "10"
+  LLM_PROVIDER: "openai"
+  RATE_LIMIT: "10/minute"

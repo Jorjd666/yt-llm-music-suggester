@@ -1,0 +1,29 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.env.*
+.venv*/
+dist/
+build/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# vscode
+.vscode/
+
+# mac
+.DS_Store
+
+# docker
+*.log
+
+# secrets
+secrets.*.yaml
