@@ -1,6 +1,7 @@
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi import Header, Depends
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -9,10 +10,20 @@ from .logger import logger
 from .schemas import SuggestRequest, SuggestResponse, Suggestion
 from .youtube_client import search_music_videos
 from .llm_client import rerank_with_llm
+import os
 
 app = FastAPI(title="yt-llm-music-suggester", version="1.0.0")
 limiter = Limiter(key_func=get_remote_address, default_limits=[settings.RATE_LIMIT])
 app.state.limiter = limiter
+
+async def require_api_token(authorization: str = Header(default="")):
+    expected = os.getenv("API_TOKEN")
+    if expected:
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing bearer token")
+        token = authorization.split(" ", 1)[1]
+        if token != expected:
+            raise HTTPException(status_code=403, detail="Invalid token")
 
 @app.exception_handler(RateLimitExceeded)
 def rate_limit_handler(request: Request, exc: RateLimitExceeded):
@@ -22,7 +33,7 @@ def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 async def healthz():
     return {"status": "ok"}
 
-@app.post("/suggest", response_model=SuggestResponse)
+@app.post("/suggest", response_model=SuggestResponse, dependencies=[Depends(require_api_token)])
 @limiter.limit(settings.RATE_LIMIT)
 async def suggest(req: SuggestRequest, request: Request):
     if not settings.YOUTUBE_API_KEY:
