@@ -1,0 +1,11 @@
+.venv
+uve
+__pycache__/
+*.pyc
+.DS_Store
+.git
+.gitignore
+tests/
+*.log
+.env
+.env.*
