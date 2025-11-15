@@ -49,7 +49,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Enable cross-compilation for multi-arch
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -67,24 +66,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Make image name lowercase: ghcr.io/<owner-lower>/yt-llm-music-suggester
+      - name: Set IMAGE env (lowercase owner)
+        run: echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
+        env:
+          OWNER: ${{ github.repository_owner }}
+
       - name: Build & push (multi-arch)
         uses: docker/build-push-action@v6
         with:
           file: ./Dockerfile
           context: .
           push: true
-          # Build BOTH arches so GCP (amd64) can pull
           platforms: linux/amd64,linux/arm64
-          # Tag latest and the commit SHA
           tags: |
-            ghcr.io/${{ github.repository_owner }}/yt-llm-music-suggester:latest
-            ghcr.io/${{ github.repository_owner }}/yt-llm-music-suggester:${{ github.sha }}
-          # Force a fresh multi-arch manifest (avoid stale single-arch cache)
+            ${{ env.GHCR_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ github.sha }}
+          # force fresh manifest so we don’t keep an arm64-only index
           pull: true
           no-cache: true
-          # Keep layer cache for future runs
+          # keep layer cache for future runs
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Disable provenance/SBOM to avoid unknown/unknown attestation entry
+          # avoid unknown/unknown attestation entry
           provenance: false
           sbom: false
