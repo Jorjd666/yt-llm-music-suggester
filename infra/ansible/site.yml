@@ -1,0 +1,217 @@
+- hosts: gcp
+  become: true
+  vars:
+    host: "{{ HOST | default('music.' + lookup('env','GCP_IP') + '.sslip.io') }}"
+    image: "{{ IMAGE | default('ghcr.io/jorjd666/yt-llm-music-suggester:latest') }}"
+    yt_key: "{{ YT_KEY | default('') }}"
+    openai_key: "{{ OPENAI_KEY | default('') }}"
+    api_token: "{{ API_TOKEN | default('') }}"
+    expose_via: "{{ EXPOSE_VIA | default('ingress') }}"   # 'ingress' or 'nodeport'
+    nodeport: 30080
+
+  pre_tasks:
+    - name: Ensure apt cache updated
+      apt: { update_cache: yes }
+      tags: [k3s, app, ingress, swap]
+
+  tasks:
+    - name: Add 2G swap (idempotent)
+      shell: |
+        if ! grep -q "/swapfile" /etc/fstab; then
+          fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+          echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
+          sysctl --system
+        fi
+      args: { executable: /bin/bash }
+      tags: [swap]
+
+    - name: Install curl & git
+      apt: { name: [curl, git], state: present }
+      tags: [k3s]
+
+    - name: Install k3s (Traefik enabled)
+      shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644" sh -s -
+      args: { creates: /usr/local/bin/k3s }
+      register: k3s_install
+      changed_when: "'Installed K3s' in k3s_install.stdout or k3s_install.rc == 0"
+      tags: [k3s]
+
+    - name: Wait for node Ready
+      shell: k3s kubectl get nodes -o name | grep node/
+      register: node_out
+      until: node_out.rc == 0
+      retries: 30
+      delay: 6
+      tags: [k3s]
+
+    - name: Wait for kube-apiserver to respond
+      shell: k3s kubectl get ns
+      register: api_ready
+      until: api_ready.rc == 0
+      retries: 30
+      delay: 6
+      tags: [k3s]
+
+    - name: Create namespace
+      shell: k3s kubectl create ns music || true
+      tags: [app, ingress]
+
+    - name: Pre-pull app image (containerd) to avoid slow first pull
+      shell: k3s ctr images pull {{ image }}
+      register: pull_img
+      failed_when: false
+      changed_when: "'resolved' in pull_img.stdout or 'exists' in pull_img.stdout"
+      tags: [app]
+
+    - name: Apply ConfigMap
+      copy:
+        dest: /tmp/cm.yaml
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata: { name: yt-llm-config, namespace: music }
+          data:
+            LLM_PROVIDER: "openai"
+            OPENAI_MODEL: "gpt-4o-mini"
+            RATE_LIMIT: "10/minute"
+            MAX_YT_RESULTS: "25"
+            MAX_SUGGESTIONS: "10"
+            REQUESTS_TIMEOUT: "10"
+      tags: [app]
+
+    - name: kubectl apply cm (no validation)
+      shell: k3s kubectl apply -f /tmp/cm.yaml --validate=false
+      tags: [app]
+
+    - name: Apply Secrets
+      copy:
+        dest: /tmp/secret.yaml
+        content: |
+          apiVersion: v1
+          kind: Secret
+          metadata: { name: yt-llm-secrets, namespace: music }
+          type: Opaque
+          stringData:
+            YOUTUBE_API_KEY: "{{ yt_key }}"
+            OPENAI_API_KEY: "{{ openai_key }}"
+            API_TOKEN: "{{ api_token }}"
+      no_log: true
+      tags: [app]
+
+    - name: kubectl apply secrets (no validation)
+      shell: k3s kubectl apply -f /tmp/secret.yaml --validate=false
+      tags: [app]
+
+    - name: Apply Deployment+Service (light resources)
+      copy:
+        dest: /tmp/app.yaml
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: yt-llm, namespace: music }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: yt-llm } }
+            template:
+              metadata: { labels: { app: yt-llm } }
+              spec:
+                containers:
+                - name: api
+                  image: {{ image }}
+                  ports: [{ containerPort: 8000 }]
+                  envFrom:
+                  - configMapRef: { name: yt-llm-config }
+                  - secretRef:    { name: yt-llm-secrets }
+                  readinessProbe: { httpGet: { path: /healthz, port: 8000 }, initialDelaySeconds: 5, periodSeconds: 10 }
+                  livenessProbe:  { httpGet: { path: /healthz, port: 8000 }, initialDelaySeconds: 10, periodSeconds: 20 }
+                  resources:
+                    requests: { cpu: "50m", memory: "64Mi" }
+                    limits:   { cpu: "200m", memory: "256Mi" }
+                  securityContext:
+                    runAsNonRoot: true
+                    runAsUser: 10001
+                    allowPrivilegeEscalation: false
+                    readOnlyRootFilesystem: true
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: yt-llm-svc
+            namespace: music
+            labels: { app: yt-llm }
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/path: "/metrics"
+              prometheus.io/port: "8000"
+          spec:
+            selector: { app: yt-llm }
+            ports:
+              - name: http
+                port: 80
+                targetPort: 8000
+      tags: [app]
+
+    - name: kubectl apply app (no validation)
+      shell: k3s kubectl apply -f /tmp/app.yaml --validate=false
+      tags: [app]
+
+    - name: Wait for rollout
+      shell: k3s kubectl -n music rollout status deploy/yt-llm
+      register: rollout
+      retries: 30
+      delay: 6
+      until: rollout.rc == 0
+      tags: [app]
+
+    - name: Expose via Ingress (Traefik) when expose_via=ingress
+      when: expose_via == 'ingress'
+      copy:
+        dest: /tmp/ing.yaml
+        content: |
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: yt-llm-ing
+            namespace: music
+            annotations:
+              kubernetes.io/ingress.class: "traefik"
+          spec:
+            rules:
+              - host: "{{ host }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: yt-llm-svc
+                          port: { number: 80 }
+      tags: [ingress]
+
+    - name: kubectl apply ingress (no validation)
+      when: expose_via == 'ingress'
+      shell: k3s kubectl apply -f /tmp/ing.yaml --validate=false
+      tags: [ingress]
+
+    - name: Expose via NodePort when expose_via=nodeport
+      when: expose_via == 'nodeport'
+      shell: |
+        k3s kubectl -n music patch svc yt-llm-svc --type='merge' -p \
+        '{"spec":{"type":"NodePort","ports":[{"name":"http","port":80,"targetPort":8000,"nodePort":{{ nodeport }} }]}}'
+      tags: [ingress]
+
+    - name: Show endpoints
+      shell: |
+        echo "App:    http://{{ host }}/"
+        echo "Health: http://{{ host }}/healthz"
+        echo "Metrics:http://{{ host }}/metrics"
+        k3s kubectl -n music get pods,svc,ingress -o wide || true
+      register: ep
+      tags: [app, ingress]
+    - debug: var=ep.stdout
+      tags: [app, ingress]
