@@ -27,3 +27,14 @@ htmlcov/
 
 # secrets
 secrets.*.yaml
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.*
+infra/terraform/terraform.tfvars
+infra/terraform/crash.log
+infra/terraform/.terraformrc
+# Python / local
+.venv/
+.env
+__pycache__/
