@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: yt-llm
+  namespace: music
+spec:
+  selector:
+    matchLabels:
+      app: yt-llm
+  namespaceSelector:
+    matchNames: [music]
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

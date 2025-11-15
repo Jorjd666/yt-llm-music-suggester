@@ -1,18 +1,13 @@
-
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: yt-llm-ingress
+  name: yt-llm-ing
+  namespace: music
   annotations:
     kubernetes.io/ingress.class: "nginx"
-    cert-manager.io/cluster-issuer: "letsencrypt-production"
 spec:
-  tls:
-    - hosts:
-        - your-domain.example.com
-      secretName: yt-llm-tls
   rules:
-    - host: your-domain.example.com
+    - host: localhost           # works on Docker Desktop
       http:
         paths:
           - path: /

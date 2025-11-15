@@ -1,7 +1,8 @@
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi import Header, Depends
+from fastapi import FastAPI, Request, Header, Depends, HTTPException
+import os
+from prometheus_fastapi_instrumentator import Instrumentator
+from fastapi.responses import JSONResponse, HTMLResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -10,20 +11,37 @@ from .logger import logger
 from .schemas import SuggestRequest, SuggestResponse, Suggestion
 from .youtube_client import search_music_videos
 from .llm_client import rerank_with_llm
-import os
 
 app = FastAPI(title="yt-llm-music-suggester", version="1.0.0")
+
+# Prometheus metrics – add middleware BEFORE app starts
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    if not getattr(app.state, "metrics_instrumented", False):
+        Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+        app.state.metrics_instrumented = True
+except Exception as e:
+    logger.warning(f"Metrics disabled: {e}")
+
 limiter = Limiter(key_func=get_remote_address, default_limits=[settings.RATE_LIMIT])
 app.state.limiter = limiter
 
-async def require_api_token(authorization: str = Header(default="")):
+def require_api_token(authorization: str = Header(default="")):
+    """
+    Enforce Bearer token only if API_TOKEN is set.
+    - 401 if header missing
+    - 403 if token wrong
+    """
     expected = os.getenv("API_TOKEN")
-    if expected:
-        if not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing bearer token")
-        token = authorization.split(" ", 1)[1]
-        if token != expected:
-            raise HTTPException(status_code=403, detail="Invalid token")
+    if not expected:
+        return  # auth disabled if no token set
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    token = authorization.split(" ", 1)[1].strip()
+    if token != expected:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
 @app.exception_handler(RateLimitExceeded)
 def rate_limit_handler(request: Request, exc: RateLimitExceeded):
@@ -32,6 +50,45 @@ def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """
+<!doctype html><meta charset="utf-8">
+<title>YT LLM Music Suggester</title>
+<style>body{font-family:system-ui;margin:2rem;max-width:780px} input,select,button{padding:.5rem;margin:.25rem}</style>
+<h1>YT LLM Music Suggester</h1>
+<div>
+  <input id="genre" placeholder="genre (e.g., lofi)" value="lofi">
+  <input id="mood"  placeholder="mood (e.g., chill)" value="chill">
+  <input id="era"   placeholder="era (e.g., modern)">
+  <input id="lang"  placeholder="language (e.g., en)">
+  <input id="limit" type="number" min="1" max="25" value="5">
+  <button onclick="go()">Suggest</button>
+</div>
+<pre id="out"></pre>
+<script>
+async function go(){
+  const body = {
+    genre:  document.getElementById('genre').value,
+    mood:   document.getElementById('mood').value || null,
+    era:    document.getElementById('era').value || null,
+    language: document.getElementById('lang').value || null,
+    limit:  parseInt(document.getElementById('limit').value || '5', 10)
+  };
+  const headers = {'Content-Type':'application/json'};
+  const token = localStorage.getItem('apiToken');
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch('/suggest', {method:'POST', headers, body: JSON.stringify(body)});
+  document.getElementById('out').textContent = await r.text();
+}
+// simple token prompt once
+if (!localStorage.getItem('apiToken')) {
+  const t = prompt("API token (optional, press cancel if none)");
+  if (t) localStorage.setItem('apiToken', t);
+}
+</script>
+"""
 
 @app.post("/suggest", response_model=SuggestResponse, dependencies=[Depends(require_api_token)])
 @limiter.limit(settings.RATE_LIMIT)
