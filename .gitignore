@@ -38,3 +38,11 @@ infra/terraform/.terraformrc
 .venv/
 .env
 __pycache__/
+infra/terraform/account.json
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.*
+infra/terraform/terraform.tfvars
+.venv/
+.env
+__pycache__/
