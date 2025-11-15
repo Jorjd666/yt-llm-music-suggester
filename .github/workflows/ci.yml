@@ -63,8 +63,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_PAT }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Make image name lowercase: ghcr.io/<owner-lower>/yt-llm-music-suggester
       - name: Set IMAGE env (lowercase owner)
