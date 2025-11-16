@@ -66,7 +66,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Make image name lowercase: ghcr.io/<owner-lower>/yt-llm-music-suggester
+      # Normalize image name (lowercase owner)
       - name: Set IMAGE env (lowercase owner)
         run: echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
         env:
@@ -92,16 +92,65 @@ jobs:
   deploy:
     needs: docker
     runs-on: ubuntu-latest
-    env:
-      GCP_VM_IP: ${{ secrets.GCP_VM_IP }}
-      HOST: music.${{ secrets.GCP_VM_IP }}.sslip.io
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate required secrets/vars
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          TF_ADDRESS_NAME: ${{ vars.TF_ADDRESS_NAME }}
+        run: |
+          set -e
+          for v in GCP_SA_KEY SSH_PRIVATE_KEY YOUTUBE_API_KEY API_TOKEN ACME_EMAIL GCP_PROJECT_ID GCP_REGION TF_ADDRESS_NAME; do
+            if [ -z "${!v}" ]; then
+              echo "❌ Missing required secret/var: $v"
+              exit 1
+            fi
+          done
+          echo "✅ All required inputs present."
 
       - name: Set IMAGE env (lowercase owner)
         run: echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
         env:
           OWNER: ${{ github.repository_owner }}
+
+      - name: Install gcloud CLI
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl apt-transport-https ca-certificates gnupg
+          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
+            | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+          curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+          sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk
+
+      - name: Resolve static IP from GCP (Terraform address)
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          TF_ADDRESS_NAME: ${{ vars.TF_ADDRESS_NAME }}
+        run: |
+          set -e
+          echo "$GCP_SA_KEY" > sa.json
+          gcloud auth activate-service-account --key-file=sa.json
+          gcloud config set project "$GCP_PROJECT_ID"
+          ip=$(gcloud compute addresses describe "$TF_ADDRESS_NAME" \
+                --region="$GCP_REGION" \
+                --format="value(address)")
+          if [ -z "$ip" ]; then
+            echo "❌ Could not resolve static IP. Check TF_ADDRESS_NAME / REGION / IAM."
+            exit 1
+          fi
+          echo "Resolved IP: $ip"
+          echo "GCP_VM_IP=$ip" >> $GITHUB_ENV
+          echo "HOST=music.${ip}.sslip.io" >> $GITHUB_ENV
 
       - name: Install Ansible + jq
         run: |
@@ -109,18 +158,29 @@ jobs:
           sudo apt-get install -y ansible jq
 
       - name: Setup SSH for Ansible
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
+          set -e
           install -m 700 -d ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          # Skip host key prompt for first time
-          printf "Host $GCP_VM_IP\n  User debian\n  StrictHostKeyChecking no\n" >> ~/.ssh/config
+          {
+            echo "Host gcpvm"
+            echo "  HostName ${GCP_VM_IP}"
+            echo "  User debian"
+            echo "  IdentityFile ~/.ssh/id_ed25519"
+            echo "  StrictHostKeyChecking no"
+          } >> ~/.ssh/config
+          # Sanity check
+          ssh -o BatchMode=yes gcpvm "echo 'SSH OK'; uname -a"
 
       - name: Create inventory.ini
         run: |
+          mkdir -p infra/ansible
           cat > infra/ansible/inventory.ini <<EOF
           [gcp]
-          $GCP_VM_IP ansible_user=debian ansible_ssh_private_key_file=~/.ssh/id_ed25519
+          gcpvm ansible_host=${GCP_VM_IP} ansible_user=debian ansible_ssh_private_key_file=~/.ssh/id_ed25519
           EOF
 
       - name: Deploy with Ansible
@@ -142,24 +202,23 @@ jobs:
             -e ACME_EMAIL="${ACME_EMAIL}" \
             -e ISSUER_ENV=production
 
-      - name: Smoke check — /healthz over HTTPS
+      - name: Smoke check — /healthz (HTTPS)
         run: |
           set -e
-          for i in {1..20}; do
+          for i in {1..25}; do
             code=$(curl -skw "%{http_code}" -o /dev/null "https://${HOST}/healthz") || code=000
             echo "Attempt $i -> HTTP $code"
             if [ "$code" = "200" ]; then exit 0; fi
-            sleep 6
+            sleep 5
           done
           echo "Health check failed"
           exit 1
 
-      - name: Smoke check — /suggest (token + simple body)
+      - name: Smoke check — /suggest (authorized)
         env:
           API_TOKEN: ${{ secrets.API_TOKEN }}
         run: |
           set -e
-          # Expect 200 + JSON with .suggestions
           curl -sS --fail \
             -H "Authorization: Bearer ${API_TOKEN}" \
             -H "Content-Type: application/json" \
