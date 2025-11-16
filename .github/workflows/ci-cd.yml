@@ -20,6 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: ${{ github.workspace }}
+      # --- make tests pass without real keys ---
+      YOUTUBE_API_KEY: "test"    # bypass YT key check
+      LLM_PROVIDER: "none"       # skip OpenAI rerank in tests
+      OPENAI_API_KEY: "unused"   # harmless placeholder
     steps:
       - uses: actions/checkout@v4
 
@@ -97,7 +101,6 @@ jobs:
     needs: docker
     runs-on: ubuntu-latest
     steps:
-      # Login to GHCR so Trivy can pull the private image manifest/layers
       - name: Login to GHCR for Trivy
         uses: docker/login-action@v3
         with:
@@ -110,7 +113,7 @@ jobs:
         with:
           image-ref: ${{ needs.docker.outputs.ghcr_image }}:${{ github.sha }}
           format: 'table'
-          exit-code: '0'               # report but do not fail the job
+          exit-code: '0'
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
