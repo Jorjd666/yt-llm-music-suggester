@@ -2,6 +2,7 @@
   become: true
   vars:
     # ---- inputs (override via -e) ----
+    k8s_ns: "{{ K8S_NS | default('music') }}"
     host: "{{ HOST | default('music.' + lookup('env','GCP_IP') + '.sslip.io') }}"
     image: "{{ IMAGE | default('ghcr.io/jorjd666/yt-llm-music-suggester:latest') }}"
     yt_key: "{{ YT_KEY | default('') }}"
@@ -110,7 +111,7 @@
       tags: [k3s]
 
     - name: Create namespace
-      shell: k3s kubectl create ns music || true
+      shell: k3s kubectl create ns {{ k8s_ns }} || true
       tags: [app, ingress]
 
     # ---------- (optional) cert-manager via Helm ----------
@@ -221,7 +222,7 @@
         content: |
           apiVersion: v1
           kind: ConfigMap
-          metadata: { name: yt-llm-config, namespace: music }
+          metadata: { name: yt-llm-config, namespace: {{ k8s_ns }} }
           data:
             LLM_PROVIDER: "openai"
             OPENAI_MODEL: "gpt-4o-mini"
@@ -241,7 +242,7 @@
         content: |
           apiVersion: v1
           kind: Secret
-          metadata: { name: yt-llm-secrets, namespace: music }
+          metadata: { name: yt-llm-secrets, namespace: {{ k8s_ns }} }
           type: Opaque
           stringData:
             YOUTUBE_API_KEY: "{{ yt_key }}"
@@ -252,6 +253,7 @@
 
     - name: kubectl apply secrets (no validation)
       shell: k3s kubectl apply -f /tmp/secret.yaml --validate=false
+      register: secrets_apply
       tags: [app]
 
     - name: Apply Deployment+Service (light resources)
@@ -260,7 +262,7 @@
         content: |
           apiVersion: apps/v1
           kind: Deployment
-          metadata: { name: yt-llm, namespace: music }
+          metadata: { name: yt-llm, namespace: {{ k8s_ns }} }
           spec:
             replicas: 1
             selector: { matchLabels: { app: yt-llm } }
@@ -289,7 +291,7 @@
           kind: Service
           metadata:
             name: yt-llm-svc
-            namespace: music
+            namespace: {{ k8s_ns }}
             labels: { app: yt-llm }
             annotations:
               prometheus.io/scrape: "true"
@@ -305,10 +307,17 @@
 
     - name: kubectl apply app (no validation)
       shell: k3s kubectl apply -f /tmp/app.yaml --validate=false
+      register: app_apply
+      tags: [app]
+
+    # ---------- refresh pods when Secret changed ----------
+    - name: Restart deployment if Secret changed (pick up new API_TOKEN)
+      when: secrets_apply is changed
+      shell: k3s kubectl -n {{ k8s_ns }} rollout restart deploy/yt-llm
       tags: [app]
 
     - name: Wait for rollout
-      shell: k3s kubectl -n music rollout status deploy/yt-llm
+      shell: k3s kubectl -n {{ k8s_ns }} rollout status deploy/yt-llm
       register: rollout
       retries: 30
       delay: 6
@@ -325,7 +334,7 @@
           kind: Ingress
           metadata:
             name: yt-llm-ing
-            namespace: music
+            namespace: {{ k8s_ns }}
             annotations:
               kubernetes.io/ingress.class: "traefik"
               cert-manager.io/cluster-issuer: "{{ issuer_name }}"
@@ -355,7 +364,7 @@
     - name: Expose via NodePort when expose_via=nodeport
       when: expose_via == 'nodeport'
       shell: |
-        k3s kubectl -n music patch svc yt-llm-svc --type='merge' -p \
+        k3s kubectl -n {{ k8s_ns }} patch svc yt-llm-svc --type='merge' -p \
         '{"spec":{"type":"NodePort","ports":[{"name":"http","port":80,"targetPort":8000,"nodePort":{{ nodeport }} }]}}'
       tags: [ingress]
 
@@ -364,7 +373,7 @@
         echo "App:    https://{{ host }}/"
         echo "Health: https://{{ host }}/healthz"
         echo "Metrics:https://{{ host }}/metrics"
-        k3s kubectl -n music get pods,svc,ingress -o wide || true
+        k3s kubectl -n {{ k8s_ns }} get pods,svc,ingress -o wide || true
       register: ep
       tags: [app, ingress]
 
