@@ -1,0 +1,157 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Run deploy after build"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  docker:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Lowercase owner for GHCR path
+      - name: Set IMAGE env (lowercase owner)
+        run: echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
+        env:
+          OWNER: ${{ github.repository_owner }}
+
+      - name: Build & push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          file: ./Dockerfile
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.GHCR_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ github.sha }}
+          pull: true
+          no-cache: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Inspect manifest (debug)
+        run: docker buildx imagetools inspect ${{ env.GHCR_IMAGE }}:latest
+
+  deploy:
+    needs: docker
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy == true)
+
+    # Silence editor warnings by routing through env
+    env:
+      APP_HOST: music.${{ secrets.GCP_VM_IP }}.sslip.io
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/yt-llm-music-suggester
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible & SSH client
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ansible openssh-client
+
+      - name: Write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.GCP_VM_IP }} >> ~/.ssh/known_hosts
+
+      - name: Create inventory
+        run: |
+          echo "${{ secrets.GCP_VM_IP }}" > infra/ansible/inventory.ini
+
+      - name: Deploy with Ansible
+        working-directory: infra/ansible
+        env:
+          # Secrets (configure these in repo settings)
+          SSH_USER: ${{ secrets.SSH_USER }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          ISSUER_ENV: production
+        run: |
+          ansible-playbook -i inventory.ini site.yml \
+            -u "$SSH_USER" \
+            --private-key ~/.ssh/id_ed25519 \
+            -e HOST="${{ env.APP_HOST }}" \
+            -e IMAGE="${{ env.GHCR_IMAGE }}:latest" \
+            -e YT_KEY="$YOUTUBE_API_KEY" \
+            -e OPENAI_KEY="$OPENAI_API_KEY" \
+            -e API_TOKEN="$API_TOKEN" \
+            -e ACME_EMAIL="$ACME_EMAIL" \
+            -e ISSUER_ENV="$ISSUER_ENV"
+
+      - name: Smoke check
+        run: |
+          curl -fsS --retry 8 --retry-connrefused --max-time 5 https://${{ env.APP_HOST }}/healthz
+          echo "OK"
