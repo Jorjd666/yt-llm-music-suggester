@@ -126,6 +126,8 @@ jobs:
       GCP_VM_IP: ${{ steps.out.outputs.gcp_ip }}
       HOST_STAGING: ${{ steps.out.outputs.host_staging }}
       HOST_PROD: ${{ steps.out.outputs.host_prod }}
+      HOST_GRAFANA_STAGING: ${{ steps.out.outputs.host_grafana_staging }}
+      HOST_GRAFANA_PROD: ${{ steps.out.outputs.host_grafana_prod }}
     steps:
       - uses: actions/checkout@v4
 
@@ -162,6 +164,8 @@ jobs:
           echo "gcp_ip=$ip" >> $GITHUB_OUTPUT
           echo "host_staging=music-staging.${ip}.sslip.io" >> $GITHUB_OUTPUT
           echo "host_prod=music.${ip}.sslip.io" >> $GITHUB_OUTPUT
+          echo "host_grafana_staging=grafana-staging.${ip}.sslip.io" >> $GITHUB_OUTPUT
+          echo "host_grafana_prod=grafana.${ip}.sslip.io" >> $GITHUB_OUTPUT
 
   deploy-staging:
     needs: [resolve-ip, trivy]
@@ -169,6 +173,7 @@ jobs:
     env:
       GCP_VM_IP: ${{ needs.resolve-ip.outputs.GCP_VM_IP }}
       HOST: ${{ needs.resolve-ip.outputs.HOST_STAGING }}
+      GRAFANA_HOST: ${{ needs.resolve-ip.outputs.HOST_GRAFANA_STAGING }}
     steps:
       - uses: actions/checkout@v4
 
@@ -238,6 +243,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
           ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          GRAFANA_HOST: ${{ env.GRAFANA_HOST }}
         run: |
           ansible-playbook -i inventory.ini site.yml \
             -e K8S_NS="staging" \
@@ -247,7 +253,9 @@ jobs:
             -e OPENAI_KEY="${OPENAI_API_KEY}" \
             -e API_TOKEN="${API_TOKEN}" \
             -e ACME_EMAIL="${ACME_EMAIL}" \
-            -e ISSUER_ENV=staging
+            -e ISSUER_ENV=staging \
+            -e GRAFANA_HOST="${GRAFANA_HOST}" \
+            -e MANAGE_MONITORING=true
 
       - name: Health check STAGING — /healthz
         id: health_staging
@@ -274,6 +282,7 @@ jobs:
     env:
       GCP_VM_IP: ${{ needs.resolve-ip.outputs.GCP_VM_IP }}
       HOST: ${{ needs.resolve-ip.outputs.HOST_PROD }}
+      GRAFANA_HOST: ${{ needs.resolve-ip.outputs.HOST_GRAFANA_PROD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -343,6 +352,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
           ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          GRAFANA_HOST: ${{ env.GRAFANA_HOST }}
         run: |
           ansible-playbook -i inventory.ini site.yml \
             -e K8S_NS="music" \
@@ -352,7 +362,9 @@ jobs:
             -e OPENAI_KEY="${OPENAI_API_KEY}" \
             -e API_TOKEN="${API_TOKEN}" \
             -e ACME_EMAIL="${ACME_EMAIL}" \
-            -e ISSUER_ENV=production
+            -e ISSUER_ENV=production \
+            -e GRAFANA_HOST="${GRAFANA_HOST}" \
+            -e MANAGE_MONITORING=true
 
       - name: Health check PROD — /healthz
         id: health_prod

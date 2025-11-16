@@ -13,6 +13,9 @@
     acme_email: "{{ ACME_EMAIL | default('') }}"            # e.g. george.duimovici@gmail.com
     issuer_env: "{{ ISSUER_ENV | default('staging') }}"     # 'staging' or 'production'
     manage_cert_manager: "{{ MANAGE_CERT_MANAGER | default(true) }}"
+    monitoring_ns: "{{ MONITORING_NS | default('monitoring') }}"
+    grafana_host: "{{ GRAFANA_HOST | default('grafana.' + lookup('env','GCP_IP') + '.sslip.io') }}"
+    manage_monitoring: "{{ MANAGE_MONITORING | default(true) }}"
 
     # ---- derived ----
     issuer_name: >-
@@ -125,13 +128,13 @@
 
     # ---------- (optional) cert-manager via Helm ----------
     - name: Install Helm (if missing)
-      when: manage_cert_manager
+      when: manage_cert_manager or manage_monitoring
       shell: |
         if ! command -v helm >/dev/null 2>&1; then
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
         fi
       args: { executable: /bin/bash }
-      tags: [ingress]
+      tags: [ingress, monitoring]
 
     - name: Add jetstack repo
       when: manage_cert_manager
@@ -140,7 +143,7 @@
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       tags: [ingress]
 
-    - name: Helm repo update
+    - name: Helm repo update (cert-manager)
       when: manage_cert_manager
       shell: helm repo update
       environment:
@@ -220,6 +223,82 @@
       when: manage_cert_manager
       shell: k3s kubectl apply -f /tmp/clusterissuer-production.yaml
       tags: [ingress]
+
+    # ---------- monitoring: kube-prometheus-stack (Prometheus + Alertmanager + Grafana) ----------
+    - name: Ensure monitoring namespace exists
+      when: manage_monitoring
+      shell: k3s kubectl create ns {{ monitoring_ns }} || true
+      tags: [monitoring]
+
+    - name: Add prometheus-community repo
+      when: manage_monitoring
+      shell: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      tags: [monitoring]
+
+    - name: Helm repo update (monitoring)
+      when: manage_monitoring
+      shell: helm repo update
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      tags: [monitoring]
+
+    - name: Install/upgrade kube-prometheus-stack (Grafana + Alertmanager)
+      when: manage_monitoring
+      shell: |
+        helm upgrade --install kps prometheus-community/kube-prometheus-stack \
+          --namespace {{ monitoring_ns }} --create-namespace \
+          --set grafana.service.type=ClusterIP \
+          --set grafana.ingress.enabled=true \
+          --set grafana.ingress.ingressClassName=traefik \
+          --set grafana.ingress.annotations."kubernetes\.io/ingress\.class"=traefik \
+          --set grafana.ingress.annotations."cert-manager\.io/cluster-issuer"="{{ issuer_name }}" \
+          --set grafana.ingress.hosts[0]="{{ grafana_host }}" \
+          --set grafana.ingress.tls[0].hosts[0]="{{ grafana_host }}" \
+          --set grafana.ingress.tls[0].secretName="grafana-tls"
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: helm_kps
+      retries: 3
+      delay: 60
+      until: helm_kps.rc == 0
+      tags: [monitoring]
+
+    - name: Wait for Grafana deployment Ready
+      when: manage_monitoring
+      shell: k3s kubectl -n {{ monitoring_ns }} rollout status deploy/kps-grafana --timeout=300s
+      tags: [monitoring]
+
+    - name: Create ServiceMonitor for yt-llm
+      when: manage_monitoring
+      copy:
+        dest: /tmp/yt-llm-servicemonitor.yaml
+        content: |
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: yt-llm-servicemonitor
+            namespace: {{ monitoring_ns }}
+            labels:
+              release: kps
+          spec:
+            selector:
+              matchLabels:
+                app: yt-llm
+            namespaceSelector:
+              matchNames:
+                - {{ k8s_ns }}
+            endpoints:
+              - port: http
+                path: /metrics
+                interval: 30s
+      tags: [monitoring]
+
+    - name: Apply ServiceMonitor for yt-llm
+      when: manage_monitoring
+      shell: k3s kubectl apply -f /tmp/yt-llm-servicemonitor.yaml
+      tags: [monitoring]
 
     # ---------- app config ----------
     - name: Pre-pull app image (containerd) to avoid slow first pull
@@ -383,12 +462,14 @@
 
     - name: Show endpoints
       shell: |
-        echo "App:    https://{{ host }}/"
-        echo "Health: https://{{ host }}/healthz"
-        echo "Metrics:https://{{ host }}/metrics"
+        echo "App:     https://{{ host }}/"
+        echo "Health:  https://{{ host }}/healthz"
+        echo "Metrics: https://{{ host }}/metrics"
+        echo "Grafana: https://{{ grafana_host }}/"
         k3s kubectl -n {{ k8s_ns }} get pods,svc,ingress -o wide || true
+        k3s kubectl -n {{ monitoring_ns }} get pods,svc,ingress -o wide || true
       register: ep
-      tags: [app, ingress]
+      tags: [app, ingress, monitoring]
 
     - debug: var=ep.stdout
-      tags: [app, ingress]
+      tags: [app, ingress, monitoring]
