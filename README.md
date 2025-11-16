@@ -1,6 +1,6 @@
 # yt-llm-music-suggester
 
-A production-minded **FastAPI** service that suggests YouTube music videos for a given *genre/mood/era/language*.
+A production-minded **FastAPI** service that suggests YouTube music videos for a given _genre/mood/era/language_.
 It fetches candidates from the **YouTube Data API v3**, then uses an **LLM** (OpenAI **or** a local Ollama model via an OpenAI-compatible API) to re-rank, diversify, and annotate picks with short descriptions and tags.
 
 ---
@@ -81,14 +81,16 @@ flowchart LR
 
 ## Quickstart (Local)
 
-1) **Create virtualenv & install dependencies (using `uv venv`)**
+1. **Create virtualenv & install dependencies (using `uv venv`)**
+
 ```bash
 uv venv
 source .venv/bin/activate          # uv creates .venv by default
 pip install -r requirements.txt
 ```
 
-2) **Configure environment**
+2. **Configure environment**
+
 ```bash
 cp .env.example .env
 # Edit .env with your keys and options
@@ -106,18 +108,22 @@ cp .env.example .env
 
 > **Ollama setup (optional)**  
 > Install Ollama, then:
+>
 > ```bash
 > ollama serve
 > ollama pull llama3.1:8b   # base model (not -instruct)
 > ```
+>
 > Update `.env` as shown above.
 
-3) **Run the API**
+3. **Run the API**
+
 ```bash
 uvicorn app.main:app --reload --port 8020
 ```
 
-4) **Try it**
+4. **Try it**
+
 ```bash
 # Health & metrics
 curl -sS http://localhost:8020/healthz
@@ -130,14 +136,15 @@ curl -sS -X POST http://localhost:8020/suggest \
   -d '{"genre":"lofi","mood":"chill","limit":3}' | jq .
 ```
 
-5) **Open the tiny UI**  
-Visit `http://localhost:8020/` in a browser.  
-(If `API_TOKEN` is set, the page will prompt once and store it in `localStorage`.)
+5. **Open the tiny UI**  
+   Visit `http://localhost:8020/` in a browser.  
+   (If `API_TOKEN` is set, the page will prompt once and store it in `localStorage`.)
 
-6) **Swagger / OpenAPI client**  
+6. **Swagger / OpenAPI client**
+
 - **Interactive docs (Swagger UI):** `http://localhost:8020/docs`  
   You can execute the `POST /suggest` call right in the browser.  
-  Click **Authorize** and paste `Bearer <API_TOKEN>` if you enabled the token.  
+  Click **Authorize** and paste `Bearer <API_TOKEN>` if you enabled the token.
 - **OpenAPI JSON:** `http://localhost:8020/openapi.json`  
   Import this into Postman/Insomnia/etc. to generate a client automatically.
 
@@ -147,25 +154,27 @@ Visit `http://localhost:8020/` in a browser.
 
 All options can be set via environment variables (in `.env` locally, or injected in your platform):
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `YOUTUBE_API_KEY` | **Yes** | — | YouTube Data API v3 key |
-| `LLM_PROVIDER` | No | `openai` | `openai` or `none` (bypass LLM re-rank) |
-| `OPENAI_API_KEY` | If using OpenAI cloud | — | OpenAI key |
-| `OPENAI_BASE_URL` | No | — | Override OpenAI base URL (e.g., `http://localhost:11434/v1` for Ollama) |
-| `OPENAI_MODEL` | No | `gpt-4o-mini` | OpenAI/Ollama model name (e.g., `llama3.1:8b`) |
-| `MAX_YT_RESULTS` | No | `25` | Size of the YouTube candidate set |
-| `MAX_SUGGESTIONS` | No | `10` | Final number of suggestions returned |
-| `REQUESTS_TIMEOUT` | No | `10` | Outbound HTTP timeout (seconds) |
-| `RATE_LIMIT` | No | `10/minute` | Per-IP rate limit for `/suggest` |
-| `API_TOKEN` | No | — | If set, `/suggest` requires `Authorization: Bearer <token>` |
+| Variable           | Required              | Default       | Description                                                             |
+| ------------------ | --------------------- | ------------- | ----------------------------------------------------------------------- |
+| `YOUTUBE_API_KEY`  | **Yes**               | —             | YouTube Data API v3 key                                                 |
+| `LLM_PROVIDER`     | No                    | `openai`      | `openai` or `none` (bypass LLM re-rank)                                 |
+| `OPENAI_API_KEY`   | If using OpenAI cloud | —             | OpenAI key                                                              |
+| `OPENAI_BASE_URL`  | No                    | —             | Override OpenAI base URL (e.g., `http://localhost:11434/v1` for Ollama) |
+| `OPENAI_MODEL`     | No                    | `gpt-4o-mini` | OpenAI/Ollama model name (e.g., `llama3.1:8b`)                          |
+| `MAX_YT_RESULTS`   | No                    | `25`          | Size of the YouTube candidate set                                       |
+| `MAX_SUGGESTIONS`  | No                    | `10`          | Final number of suggestions returned                                    |
+| `REQUESTS_TIMEOUT` | No                    | `10`          | Outbound HTTP timeout (seconds)                                         |
+| `RATE_LIMIT`       | No                    | `10/minute`   | Per-IP rate limit for `/suggest`                                        |
+| `API_TOKEN`        | No                    | —             | If set, `/suggest` requires `Authorization: Bearer <token>`             |
 
 ---
 
 ## API
 
 ### `POST /suggest`
+
 **Request**
+
 ```json
 {
   "genre": "rock",
@@ -177,6 +186,7 @@ All options can be set via environment variables (in `.env` locally, or injected
 ```
 
 **Response**
+
 ```json
 {
   "suggestions": [
@@ -195,12 +205,15 @@ All options can be set via environment variables (in `.env` locally, or injected
 ```
 
 ### `GET /healthz`
+
 Liveness probe.
 
 ### `GET /metrics`
+
 Prometheus metrics exposed by `prometheus_fastapi_instrumentator`.
 
 ### `GET /docs`
+
 Swagger UI (interactive) — run API calls from your browser.
 
 ---
@@ -208,6 +221,7 @@ Swagger UI (interactive) — run API calls from your browser.
 ## Docker
 
 Build & run locally:
+
 ```bash
 docker build -t yt-llm-music-suggester:latest .
 docker run --rm \
@@ -215,9 +229,11 @@ docker run --rm \
   --env-file .env \
   yt-llm-music-suggester:latest
 ```
+
 > ✅ Keeping `8020:8000` is correct here because the container listens on **8000**, and we expose it on **localhost:8020**.
 
 Multi-arch image is published by CI to GHCR:
+
 ```
 ghcr.io/<owner>/yt-llm-music-suggester:latest
 ```
@@ -229,37 +245,45 @@ ghcr.io/<owner>/yt-llm-music-suggester:latest
 **Prereqs**: a cluster (Docker Desktop k8s / k3s / GKE), and an ingress (e.g., Traefik or NGINX).  
 We ship example manifests in `k8s/`.
 
-1) **Create ConfigMap & Secret** (or manage secrets your way)
+1. **Create ConfigMap & Secret** (or manage secrets your way)
+
 ```bash
 kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/secret.example.yaml  # edit or replace with your real Secret
 ```
 
-2) **Deploy service**
+2. **Deploy service**
+
 ```bash
 kubectl apply -f k8s/deployment.yaml
 kubectl apply -f k8s/service.yaml
 ```
 
-3) **Ingress**
+3. **Ingress**
+
 - With **Traefik** + `sslip.io` host (e.g., `music.<EXTERNAL-IP>.sslip.io`):
+
 ```bash
 kubectl apply -f k8s/ingress.yaml
 ```
 
 **Why `sslip.io`?**  
-`sslip.io` is a free wildcard DNS service that converts an IP address into a valid hostname (e.g., `34.61.9.73.sslip.io`).  
-This lets you test Ingress hosts **without buying a domain** or managing DNS records.  
-- Works great for demos/POCs and local/k3s clusters.  
+`sslip.io` is a free wildcard DNS service that converts an IP address into a valid hostname (e.g., `34.40.121.89.sslip.io`).  
+This lets you test Ingress hosts **without buying a domain** or managing DNS records.
+
+- Works great for demos/POCs and local/k3s clusters.
 - When you’re ready for production, switch to your real domain and add TLS via cert‑manager + Let’s Encrypt.
 
-4) **Rollout / updates**
+4. **Rollout / updates**
+
 - **Pin by digest** (recommended on Apple Silicon):
+
 ```bash
 kubectl -n music set image deploy/yt-llm \
   api=ghcr.io/<owner>/yt-llm-music-suggester@sha256:<arm64_or_amd64_digest>
 kubectl -n music rollout status deploy/yt-llm
 ```
+
 - Or use `:latest` and set `imagePullPolicy: Always` for the container.
 
 ---

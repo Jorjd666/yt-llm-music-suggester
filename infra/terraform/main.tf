@@ -20,7 +20,6 @@ resource "google_compute_instance" "vm" {
   machine_type = var.machine_type
   zone         = var.zone
 
-  # allow resize on running instance
   allow_stopping_for_update = true
 
   boot_disk {
@@ -41,8 +40,14 @@ resource "google_compute_instance" "vm" {
   }
 
   tags = ["http-server", "https-server"]
+
+  labels = {
+    app = var.instance_name
+    env = "dev"
+  }
 }
 
 output "external_ip" {
-  value = google_compute_address.ip.address
+  description = "Static external IP for the k3s node"
+  value       = google_compute_address.ip.address
 }

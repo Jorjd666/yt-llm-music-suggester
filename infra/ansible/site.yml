@@ -1,20 +1,69 @@
 - hosts: gcp
   become: true
   vars:
+    # ---- inputs (override via -e) ----
     host: "{{ HOST | default('music.' + lookup('env','GCP_IP') + '.sslip.io') }}"
     image: "{{ IMAGE | default('ghcr.io/jorjd666/yt-llm-music-suggester:latest') }}"
     yt_key: "{{ YT_KEY | default('') }}"
     openai_key: "{{ OPENAI_KEY | default('') }}"
     api_token: "{{ API_TOKEN | default('') }}"
-    expose_via: "{{ EXPOSE_VIA | default('ingress') }}"   # 'ingress' or 'nodeport'
+    expose_via: "{{ EXPOSE_VIA | default('ingress') }}"     # 'ingress' or 'nodeport'
     nodeport: 30080
+    acme_email: "{{ ACME_EMAIL | default('') }}"            # e.g. george.duimovici@gmail.com
+    issuer_env: "{{ ISSUER_ENV | default('staging') }}"     # 'staging' or 'production'
+    manage_cert_manager: "{{ MANAGE_CERT_MANAGER | default(true) }}"
+
+    # ---- derived ----
+    issuer_name: >-
+      {{ 'letsencrypt-production' if issuer_env == 'production' else 'letsencrypt-staging' }}
+    acme_server: >-
+      {{ 'https://acme-v02.api.letsencrypt.org/directory'
+         if issuer_env == 'production'
+         else 'https://acme-staging-v02.api.letsencrypt.org/directory' }}
 
   pre_tasks:
-    - name: Ensure apt cache updated
-      apt: { update_cache: yes }
+    - name: Force noninteractive apt
+      copy:
+        dest: /etc/apt/apt.conf.d/90noninteractive
+        content: |
+          APT::Get::Assume-Yes "true";
+          APT::Get::force-yes "true";
+          Dpkg::Options {
+            "--force-confdef";
+            "--force-confold";
+          }
+      tags: [k3s, app, ingress, swap]
+
+    - name: Prefer IPv4 for apt (avoid IPv6 resolver issues)
+      copy:
+        dest: /etc/apt/apt.conf.d/99force-ipv4
+        content: |
+          Acquire::ForceIPv4 "true";
+      tags: [k3s, app, ingress, swap]
+
+    - name: Clear apt/dpkg locks if present (safe no-op if none)
+      shell: |
+        set -euxo pipefail
+        rm -f /var/lib/apt/lists/lock || true
+        rm -f /var/cache/apt/archives/lock || true
+        rm -f /var/lib/dpkg/lock-frontend || true
+        dpkg --configure -a || true
+      args: { executable: /bin/bash }
+      tags: [k3s, app, ingress, swap]
+
+    - name: Ensure apt cache updated (with retries)
+      apt:
+        update_cache: yes
+        force_apt_get: yes
+        cache_valid_time: 3600
+      register: apt_update
+      retries: 6
+      delay: 10
+      until: apt_update is succeeded
       tags: [k3s, app, ingress, swap]
 
   tasks:
+    # ---------- system prep ----------
     - name: Add 2G swap (idempotent)
       shell: |
         if ! grep -q "/swapfile" /etc/fstab; then
@@ -29,10 +78,13 @@
       args: { executable: /bin/bash }
       tags: [swap]
 
-    - name: Install curl & git
-      apt: { name: [curl, git], state: present }
+    - name: Install base tools
+      apt:
+        name: [curl, git, ca-certificates]
+        state: present
       tags: [k3s]
 
+    # ---------- k3s ----------
     - name: Install k3s (Traefik enabled)
       shell: |
         curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644" sh -s -
@@ -61,6 +113,101 @@
       shell: k3s kubectl create ns music || true
       tags: [app, ingress]
 
+    # ---------- (optional) cert-manager via Helm ----------
+    - name: Install Helm (if missing)
+      when: manage_cert_manager
+      shell: |
+        if ! command -v helm >/dev/null 2>&1; then
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        fi
+      args: { executable: /bin/bash }
+      tags: [ingress]
+
+    - name: Add jetstack repo
+      when: manage_cert_manager
+      shell: helm repo add jetstack https://charts.jetstack.io || true
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      tags: [ingress]
+
+    - name: Helm repo update
+      when: manage_cert_manager
+      shell: helm repo update
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      tags: [ingress]
+
+    - name: Install/upgrade cert-manager (CRDs enabled)
+      when: manage_cert_manager
+      shell: |
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set crds.enabled=true
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      tags: [ingress]
+
+    - name: Wait for cert-manager pods Ready
+      when: manage_cert_manager
+      shell: |
+        k3s kubectl -n cert-manager rollout status deploy/cert-manager --timeout=180s && \
+        k3s kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s && \
+        k3s kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
+      tags: [ingress]
+
+    - name: Create ClusterIssuer (staging)
+      when: manage_cert_manager
+      copy:
+        dest: /tmp/clusterissuer-staging.yaml
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              email: "{{ acme_email | default('george.duimovici@gmail.com') }}"
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              privateKeySecretRef:
+                name: letsencrypt-staging-key
+              solvers:
+              - http01:
+                  ingress:
+                    class: traefik
+      tags: [ingress]
+
+    - name: Apply ClusterIssuer (staging)
+      when: manage_cert_manager
+      shell: k3s kubectl apply -f /tmp/clusterissuer-staging.yaml
+      tags: [ingress]
+
+    - name: Create ClusterIssuer (production)
+      when: manage_cert_manager
+      copy:
+        dest: /tmp/clusterissuer-production.yaml
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-production
+          spec:
+            acme:
+              email: "{{ acme_email | default('george.duimovici@gmail.com') }}"
+              server: https://acme-v02.api.letsencrypt.org/directory
+              privateKeySecretRef:
+                name: letsencrypt-production-key
+              solvers:
+              - http01:
+                  ingress:
+                    class: traefik
+      tags: [ingress]
+
+    - name: Apply ClusterIssuer (production)
+      when: manage_cert_manager
+      shell: k3s kubectl apply -f /tmp/clusterissuer-production.yaml
+      tags: [ingress]
+
+    # ---------- app config ----------
     - name: Pre-pull app image (containerd) to avoid slow first pull
       shell: k3s ctr images pull {{ image }}
       register: pull_img
@@ -168,7 +315,8 @@
       until: rollout.rc == 0
       tags: [app]
 
-    - name: Expose via Ingress (Traefik) when expose_via=ingress
+    # ---------- exposure ----------
+    - name: Write Ingress manifest (Traefik) with TLS + issuer
       when: expose_via == 'ingress'
       copy:
         dest: /tmp/ing.yaml
@@ -180,17 +328,23 @@
             namespace: music
             annotations:
               kubernetes.io/ingress.class: "traefik"
+              cert-manager.io/cluster-issuer: "{{ issuer_name }}"
           spec:
+            ingressClassName: traefik
+            tls:
+            - hosts: ["{{ host }}"]
+              secretName: yt-llm-tls
             rules:
-              - host: "{{ host }}"
-                http:
-                  paths:
-                    - path: /
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: yt-llm-svc
-                          port: { number: 80 }
+            - host: "{{ host }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: yt-llm-svc
+                      port:
+                        number: 80
       tags: [ingress]
 
     - name: kubectl apply ingress (no validation)
@@ -207,11 +361,12 @@
 
     - name: Show endpoints
       shell: |
-        echo "App:    http://{{ host }}/"
-        echo "Health: http://{{ host }}/healthz"
-        echo "Metrics:http://{{ host }}/metrics"
+        echo "App:    https://{{ host }}/"
+        echo "Health: https://{{ host }}/healthz"
+        echo "Metrics:https://{{ host }}/metrics"
         k3s kubectl -n music get pods,svc,ingress -o wide || true
       register: ep
       tags: [app, ingress]
+
     - debug: var=ep.stdout
       tags: [app, ingress]
