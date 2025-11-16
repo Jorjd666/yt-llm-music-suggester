@@ -51,9 +51,7 @@ resource "google_compute_instance" "k3s_vm" {
   }
 
   # Enable OS Login (recommended)
-  metadata = {
-    enable-oslogin = "TRUE"
-  }
+   metadata = {}
 
   service_account {
     email  = var.service_account_email
