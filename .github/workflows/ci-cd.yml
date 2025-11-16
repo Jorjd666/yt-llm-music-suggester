@@ -5,13 +5,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
-    inputs:
-      deploy:
-        description: "Run deploy after build"
-        required: false
-        type: boolean
-        default: true
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -72,7 +66,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Lowercase owner for GHCR path
+      # Make image name lowercase: ghcr.io/<owner-lower>/yt-llm-music-suggester
       - name: Set IMAGE env (lowercase owner)
         run: echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
         env:
@@ -95,63 +89,80 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Inspect manifest (debug)
-        run: docker buildx imagetools inspect ${{ env.GHCR_IMAGE }}:latest
-
   deploy:
     needs: docker
     runs-on: ubuntu-latest
-    if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && inputs.deploy == true)
-
-    # Silence editor warnings by routing through env
     env:
-      APP_HOST: music.${{ secrets.GCP_VM_IP }}.sslip.io
-      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/yt-llm-music-suggester
-
+      GCP_VM_IP: ${{ secrets.GCP_VM_IP }}
+      HOST: music.${{ secrets.GCP_VM_IP }}.sslip.io
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ansible & SSH client
+      - name: Set IMAGE env (lowercase owner)
+        run: echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
+        env:
+          OWNER: ${{ github.repository_owner }}
+
+      - name: Install Ansible + jq
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ansible openssh-client
+          sudo apt-get install -y ansible jq
 
-      - name: Write SSH key
+      - name: Setup SSH for Ansible
         run: |
-          mkdir -p ~/.ssh
+          install -m 700 -d ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H ${{ secrets.GCP_VM_IP }} >> ~/.ssh/known_hosts
+          # Skip host key prompt for first time
+          printf "Host $GCP_VM_IP\n  User debian\n  StrictHostKeyChecking no\n" >> ~/.ssh/config
 
-      - name: Create inventory
+      - name: Create inventory.ini
         run: |
-          echo "${{ secrets.GCP_VM_IP }}" > infra/ansible/inventory.ini
+          cat > infra/ansible/inventory.ini <<EOF
+          [gcp]
+          $GCP_VM_IP ansible_user=debian ansible_ssh_private_key_file=~/.ssh/id_ed25519
+          EOF
 
       - name: Deploy with Ansible
         working-directory: infra/ansible
         env:
-          # Secrets (configure these in repo settings)
-          SSH_USER: ${{ secrets.SSH_USER }}
+          HOST: ${{ env.HOST }}
+          IMAGE: ${{ env.GHCR_IMAGE }}:latest
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
           ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
-          ISSUER_ENV: production
         run: |
           ansible-playbook -i inventory.ini site.yml \
-            -u "$SSH_USER" \
-            --private-key ~/.ssh/id_ed25519 \
-            -e HOST="${{ env.APP_HOST }}" \
-            -e IMAGE="${{ env.GHCR_IMAGE }}:latest" \
-            -e YT_KEY="$YOUTUBE_API_KEY" \
-            -e OPENAI_KEY="$OPENAI_API_KEY" \
-            -e API_TOKEN="$API_TOKEN" \
-            -e ACME_EMAIL="$ACME_EMAIL" \
-            -e ISSUER_ENV="$ISSUER_ENV"
+            -e HOST="${HOST}" \
+            -e IMAGE="${IMAGE}" \
+            -e YT_KEY="${YOUTUBE_API_KEY}" \
+            -e OPENAI_KEY="${OPENAI_API_KEY}" \
+            -e API_TOKEN="${API_TOKEN}" \
+            -e ACME_EMAIL="${ACME_EMAIL}" \
+            -e ISSUER_ENV=production
 
-      - name: Smoke check
+      - name: Smoke check — /healthz over HTTPS
         run: |
-          curl -fsS --retry 8 --retry-connrefused --max-time 5 https://${{ env.APP_HOST }}/healthz
-          echo "OK"
+          set -e
+          for i in {1..20}; do
+            code=$(curl -skw "%{http_code}" -o /dev/null "https://${HOST}/healthz") || code=000
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 6
+          done
+          echo "Health check failed"
+          exit 1
+
+      - name: Smoke check — /suggest (token + simple body)
+        env:
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+        run: |
+          set -e
+          # Expect 200 + JSON with .suggestions
+          curl -sS --fail \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"genre":"lofi","mood":"chill","limit":3}' \
+            "https://${HOST}/suggest" | jq -e '.suggestions' >/dev/null
+          echo "Suggest endpoint OK"
