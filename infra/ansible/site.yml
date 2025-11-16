@@ -128,7 +128,7 @@
 
     # ---------- (optional) cert-manager via Helm ----------
     - name: Install Helm (if missing)
-      when: manage_cert_manager or manage_monitoring
+      when: manage_cert_manager | bool or manage_monitoring | bool
       shell: |
         if ! command -v helm >/dev/null 2>&1; then
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
@@ -137,21 +137,21 @@
       tags: [ingress, monitoring]
 
     - name: Add jetstack repo
-      when: manage_cert_manager
+      when: manage_cert_manager | bool
       shell: helm repo add jetstack https://charts.jetstack.io || true
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       tags: [ingress]
 
     - name: Helm repo update (cert-manager)
-      when: manage_cert_manager
+      when: manage_cert_manager | bool
       shell: helm repo update
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       tags: [ingress]
 
     - name: Install/upgrade cert-manager (CRDs enabled)
-      when: manage_cert_manager
+      when: manage_cert_manager | bool
       shell: |
         helm upgrade --install cert-manager jetstack/cert-manager \
           --namespace cert-manager --create-namespace \
@@ -165,7 +165,7 @@
       tags: [ingress]
 
     - name: Wait for cert-manager pods Ready
-      when: manage_cert_manager
+      when: manage_cert_manager | bool
       shell: |
         k3s kubectl -n cert-manager rollout status deploy/cert-manager --timeout=180s && \
         k3s kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s && \
@@ -173,7 +173,7 @@
       tags: [ingress]
 
     - name: Create ClusterIssuer (staging)
-      when: manage_cert_manager
+      when: manage_cert_manager | bool
       copy:
         dest: /tmp/clusterissuer-staging.yaml
         content: |
@@ -194,12 +194,12 @@
       tags: [ingress]
 
     - name: Apply ClusterIssuer (staging)
-      when: manage_cert_manager
+      when: manage_cert_manager | bool
       shell: k3s kubectl apply -f /tmp/clusterissuer-staging.yaml
       tags: [ingress]
 
     - name: Create ClusterIssuer (production)
-      when: manage_cert_manager
+      when: manage_cert_manager | bool
       copy:
         dest: /tmp/clusterissuer-production.yaml
         content: |
@@ -220,32 +220,32 @@
       tags: [ingress]
 
     - name: Apply ClusterIssuer (production)
-      when: manage_cert_manager
+      when: manage_cert_manager | bool
       shell: k3s kubectl apply -f /tmp/clusterissuer-production.yaml
       tags: [ingress]
 
     # ---------- monitoring: kube-prometheus-stack (Prometheus + Alertmanager + Grafana) ----------
     - name: Ensure monitoring namespace exists
-      when: manage_monitoring
+      when: manage_monitoring | bool
       shell: k3s kubectl create ns {{ monitoring_ns }} || true
       tags: [monitoring]
 
     - name: Add prometheus-community repo
-      when: manage_monitoring
+      when: manage_monitoring | bool
       shell: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       tags: [monitoring]
 
     - name: Helm repo update (monitoring)
-      when: manage_monitoring
+      when: manage_monitoring | bool
       shell: helm repo update
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       tags: [monitoring]
 
     - name: Install/upgrade kube-prometheus-stack (Grafana + Alertmanager)
-      when: manage_monitoring
+      when: manage_monitoring | bool
       shell: |
         helm upgrade --install kps prometheus-community/kube-prometheus-stack \
           --namespace {{ monitoring_ns }} --create-namespace \
@@ -266,12 +266,12 @@
       tags: [monitoring]
 
     - name: Wait for Grafana deployment Ready
-      when: manage_monitoring
+      when: manage_monitoring | bool
       shell: k3s kubectl -n {{ monitoring_ns }} rollout status deploy/kps-grafana --timeout=300s
       tags: [monitoring]
 
     - name: Create ServiceMonitor for yt-llm
-      when: manage_monitoring
+      when: manage_monitoring | bool
       copy:
         dest: /tmp/yt-llm-servicemonitor.yaml
         content: |
@@ -296,7 +296,7 @@
       tags: [monitoring]
 
     - name: Apply ServiceMonitor for yt-llm
-      when: manage_monitoring
+      when: manage_monitoring | bool
       shell: k3s kubectl apply -f /tmp/yt-llm-servicemonitor.yaml
       tags: [monitoring]
 
