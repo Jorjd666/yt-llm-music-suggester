@@ -46,6 +46,8 @@ jobs:
   docker:
     needs: build-test
     runs-on: ubuntu-latest
+    outputs:
+      ghcr_image: ${{ steps.setimg.outputs.ghcr_image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -66,9 +68,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Normalize image name (lowercase owner)
       - name: Set IMAGE env (lowercase owner)
-        run: echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
+        id: setimg
+        run: |
+          echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
+          echo "ghcr_image=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_OUTPUT
         env:
           OWNER: ${{ github.repository_owner }}
 
@@ -89,9 +93,79 @@ jobs:
           provenance: false
           sbom: false
 
-  deploy:
+  trivy:
     needs: docker
     runs-on: ubuntu-latest
+    steps:
+      # Login to GHCR so Trivy can pull the private image manifest/layers
+      - name: Login to GHCR for Trivy
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy image scan (non-blocking)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ needs.docker.outputs.ghcr_image }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '0'               # report but do not fail the job
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          timeout: '5m'
+
+  resolve-ip:
+    needs: docker
+    runs-on: ubuntu-latest
+    outputs:
+      GCP_VM_IP: ${{ steps.out.outputs.gcp_ip }}
+      HOST_STAGING: ${{ steps.out.outputs.host_staging }}
+      HOST_PROD: ${{ steps.out.outputs.host_prod }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcloud CLI
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl apt-transport-https ca-certificates gnupg
+          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
+            | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+          curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+          sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk
+
+      - name: Resolve static IP from GCP (Terraform address)
+        id: out
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          TF_ADDRESS_NAME: ${{ vars.TF_ADDRESS_NAME }}
+        run: |
+          set -e
+          echo "$GCP_SA_KEY" > sa.json
+          gcloud auth activate-service-account --key-file=sa.json
+          gcloud config set project "$GCP_PROJECT_ID"
+          ip=$(gcloud compute addresses describe "$TF_ADDRESS_NAME" \
+                --region="$GCP_REGION" \
+                --format="value(address)")
+          if [ -z "$ip" ]; then
+            echo "❌ Could not resolve static IP. Check TF_ADDRESS_NAME / REGION / IAM."
+            exit 1
+          fi
+          echo "Resolved IP: $ip"
+          echo "gcp_ip=$ip" >> $GITHUB_OUTPUT
+          echo "host_staging=music-staging.${ip}.sslip.io" >> $GITHUB_OUTPUT
+          echo "host_prod=music.${ip}.sslip.io" >> $GITHUB_OUTPUT
+
+  deploy-staging:
+    needs: [resolve-ip, trivy]
+    runs-on: ubuntu-latest
+    env:
+      GCP_VM_IP: ${{ needs.resolve-ip.outputs.GCP_VM_IP }}
+      HOST: ${{ needs.resolve-ip.outputs.HOST_STAGING }}
     steps:
       - uses: actions/checkout@v4
 
@@ -120,38 +194,6 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
 
-      - name: Install gcloud CLI
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y curl apt-transport-https ca-certificates gnupg
-          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
-            | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
-          curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-            | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
-          sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk
-
-      - name: Resolve static IP from GCP (Terraform address)
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          TF_ADDRESS_NAME: ${{ vars.TF_ADDRESS_NAME }}
-        run: |
-          set -e
-          echo "$GCP_SA_KEY" > sa.json
-          gcloud auth activate-service-account --key-file=sa.json
-          gcloud config set project "$GCP_PROJECT_ID"
-          ip=$(gcloud compute addresses describe "$TF_ADDRESS_NAME" \
-                --region="$GCP_REGION" \
-                --format="value(address)")
-          if [ -z "$ip" ]; then
-            echo "❌ Could not resolve static IP. Check TF_ADDRESS_NAME / REGION / IAM."
-            exit 1
-          fi
-          echo "Resolved IP: $ip"
-          echo "GCP_VM_IP=$ip" >> $GITHUB_ENV
-          echo "HOST=music.${ip}.sslip.io" >> $GITHUB_ENV
-
       - name: Install Ansible + jq
         run: |
           sudo apt-get update -y
@@ -160,6 +202,7 @@ jobs:
       - name: Setup SSH for Ansible
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          GCP_VM_IP: ${{ env.GCP_VM_IP }}
         run: |
           set -e
           install -m 700 -d ~/.ssh
@@ -172,7 +215,6 @@ jobs:
             echo "  IdentityFile ~/.ssh/id_ed25519"
             echo "  StrictHostKeyChecking no"
           } >> ~/.ssh/config
-          # Sanity check
           ssh -o BatchMode=yes gcpvm "echo 'SSH OK'; uname -a"
 
       - name: Create inventory.ini
@@ -183,7 +225,8 @@ jobs:
           gcpvm ansible_host=${GCP_VM_IP} ansible_user=debian ansible_ssh_private_key_file=~/.ssh/id_ed25519
           EOF
 
-      - name: Deploy with Ansible
+      - name: Deploy to STAGING with Ansible
+        id: deploy_staging
         working-directory: infra/ansible
         env:
           HOST: ${{ env.HOST }}
@@ -194,15 +237,17 @@ jobs:
           ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
         run: |
           ansible-playbook -i inventory.ini site.yml \
+            -e K8S_NS="staging" \
             -e HOST="${HOST}" \
             -e IMAGE="${IMAGE}" \
             -e YT_KEY="${YOUTUBE_API_KEY}" \
             -e OPENAI_KEY="${OPENAI_API_KEY}" \
             -e API_TOKEN="${API_TOKEN}" \
             -e ACME_EMAIL="${ACME_EMAIL}" \
-            -e ISSUER_ENV=production
+            -e ISSUER_ENV=staging
 
-      - name: Smoke check — /healthz (HTTPS)
+      - name: Health check STAGING — /healthz
+        id: health_staging
         run: |
           set -e
           for i in {1..25}; do
@@ -211,5 +256,116 @@ jobs:
             if [ "$code" = "200" ]; then exit 0; fi
             sleep 5
           done
-          echo "Health check failed"
+          exit 1
+
+      - name: Rollback STAGING on failed health
+        if: failure() && steps.deploy_staging.outcome == 'success'
+        run: |
+          echo "Health check failed. Rolling back STAGING…"
+          ssh gcpvm "sudo k3s kubectl -n staging rollout undo deploy/yt-llm || true"
+          exit 1
+
+  deploy-prod:
+    needs: [resolve-ip, deploy-staging]
+    runs-on: ubuntu-latest
+    env:
+      GCP_VM_IP: ${{ needs.resolve-ip.outputs.GCP_VM_IP }}
+      HOST: ${{ needs.resolve-ip.outputs.HOST_PROD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required secrets/vars
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          TF_ADDRESS_NAME: ${{ vars.TF_ADDRESS_NAME }}
+        run: |
+          set -e
+          for v in GCP_SA_KEY SSH_PRIVATE_KEY YOUTUBE_API_KEY API_TOKEN ACME_EMAIL GCP_PROJECT_ID GCP_REGION TF_ADDRESS_NAME; do
+            if [ -z "${!v}" ]; then
+              echo "❌ Missing required secret/var: $v"
+              exit 1
+            fi
+          done
+          echo "✅ All required inputs present."
+
+      - name: Set IMAGE env (lowercase owner)
+        run: echo "GHCR_IMAGE=ghcr.io/${OWNER,,}/yt-llm-music-suggester" >> $GITHUB_ENV
+        env:
+          OWNER: ${{ github.repository_owner }}
+
+      - name: Install Ansible + jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ansible jq
+
+      - name: Setup SSH for Ansible
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          GCP_VM_IP: ${{ env.GCP_VM_IP }}
+        run: |
+          set -e
+          install -m 700 -d ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          {
+            echo "Host gcpvm"
+            echo "  HostName ${GCP_VM_IP}"
+            echo "  User debian"
+            echo "  IdentityFile ~/.ssh/id_ed25519"
+            echo "  StrictHostKeyChecking no"
+          } >> ~/.ssh/config
+          ssh -o BatchMode=yes gcpvm "echo 'SSH OK'; uname -a"
+
+      - name: Create inventory.ini
+        run: |
+          mkdir -p infra/ansible
+          cat > infra/ansible/inventory.ini <<EOF
+          [gcp]
+          gcpvm ansible_host=${GCP_VM_IP} ansible_user=debian ansible_ssh_private_key_file=~/.ssh/id_ed25519
+          EOF
+
+      - name: Deploy to PROD with Ansible
+        id: deploy_prod
+        working-directory: infra/ansible
+        env:
+          HOST: ${{ env.HOST }}
+          IMAGE: ${{ env.GHCR_IMAGE }}:latest
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+        run: |
+          ansible-playbook -i inventory.ini site.yml \
+            -e K8S_NS="music" \
+            -e HOST="${HOST}" \
+            -e IMAGE="${IMAGE}" \
+            -e YT_KEY="${YOUTUBE_API_KEY}" \
+            -e OPENAI_KEY="${OPENAI_API_KEY}" \
+            -e API_TOKEN="${API_TOKEN}" \
+            -e ACME_EMAIL="${ACME_EMAIL}" \
+            -e ISSUER_ENV=production
+
+      - name: Health check PROD — /healthz
+        id: health_prod
+        run: |
+          set -e
+          for i in {1..25}; do
+            code=$(curl -skw "%{http_code}" -o /dev/null "https://${HOST}/healthz") || code=000
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Rollback PROD on failed health
+        if: failure() && steps.deploy_prod.outcome == 'success'
+        run: |
+          echo "Health check failed. Rolling back PROD…"
+          ssh gcpvm "sudo k3s kubectl -n music rollout undo deploy/yt-llm || true"
           exit 1
