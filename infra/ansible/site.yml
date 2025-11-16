@@ -94,20 +94,29 @@
       changed_when: "'Installed K3s' in k3s_install.stdout or k3s_install.rc == 0"
       tags: [k3s]
 
-    - name: Wait for node Ready
-      shell: k3s kubectl get nodes -o name | grep node/
-      register: node_out
-      until: node_out.rc == 0
-      retries: 30
-      delay: 6
+    - name: Wait for k3s systemd service to be active
+      shell: systemctl is-active --quiet k3s
+      register: k3s_svc
+      retries: 40
+      delay: 5
+      until: k3s_svc.rc == 0
+      tags: [k3s]
+
+    - name: Wait for node to be Ready
+      shell: |
+        k3s kubectl get nodes -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}'
+      register: node_ready
+      retries: 40
+      delay: 5
+      until: node_ready.stdout == "True"
       tags: [k3s]
 
     - name: Wait for kube-apiserver to respond
       shell: k3s kubectl get ns
       register: api_ready
+      retries: 40
+      delay: 5
       until: api_ready.rc == 0
-      retries: 30
-      delay: 6
       tags: [k3s]
 
     - name: Create namespace
@@ -146,6 +155,10 @@
           --set crds.enabled=true
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: helm_certmgr
+      retries: 3
+      delay: 30
+      until: helm_certmgr.rc == 0
       tags: [ingress]
 
     - name: Wait for cert-manager pods Ready
