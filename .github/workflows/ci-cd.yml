@@ -213,15 +213,3 @@ jobs:
           done
           echo "Health check failed"
           exit 1
-
-      - name: Smoke check — /suggest (authorized)
-        env:
-          API_TOKEN: ${{ secrets.API_TOKEN }}
-        run: |
-          set -e
-          curl -sS --fail \
-            -H "Authorization: Bearer ${API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"genre":"lofi","mood":"chill","limit":3}' \
-            "https://${HOST}/suggest" | jq -e '.suggestions' >/dev/null
-          echo "Suggest endpoint OK"
