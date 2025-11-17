@@ -1,387 +1,303 @@
-# yt-llm-music-suggester
+# yt-llm-music-suggester – Demo & Operations Cheat Sheet
 
-A production-minded **FastAPI** service that suggests YouTube music videos for a given _genre/mood/era/language_.
-It fetches candidates from the **YouTube Data API v3**, then uses an **LLM** (OpenAI **or** a local Ollama model via an OpenAI-compatible API) to re-rank, diversify, and annotate picks with short descriptions and tags.
+**demo-friendly** README, focused on:
 
----
+- What the app does (in human words)
+- How to use the **GUI** in the browser
+- How to call the API with **curl** (and get ✅ positive responses)
+- How to authenticate with the **Bearer token**
+- How to open **Grafana** (dashboards) and **Alertmanager** (alerts)
+- Where to look for deeper docs
 
-## Features
+For full technical details, see:
 
-- **FastAPI** backend: `/healthz`, `/suggest`, `/metrics` (Prometheus)
-- **Tiny browser UI** at `/` (no build tools): inputs + thumbnail cards with links & reasons
-- **YouTube search (Music category)** with retries and robust error handling
-- **LLM re-ranking + enrichment** (OpenAI cloud or local **Ollama** with `OPENAI_BASE_URL`)
-- **Rate limiting** via `slowapi` (e.g., `10/minute`)
-- **Structured logging** with `loguru`
-- **12-factor config** via env vars and `.env`
-- **Unit tests** with `pytest`
-- **Docker** multi-stage build
-- **GitHub Actions** CI: tests + **multi-arch** image (linux/amd64 & linux/arm64) pushed to GHCR
-- **Kubernetes**: Deployment, Service, Ingress (Traefik), liveness/readiness, resource limits/requests
-- **Monitoring**: `/metrics` for Prometheus; `/healthz` for probes
-- **Cloud-ready**: Terraform (GCP VM + firewall + static IP) & Ansible (K3s install + rollout)
-- **Cost awareness**: throttle YouTube results & LLM budget; can disable LLM (`LLM_PROVIDER=none`)
+- `ARCHITECTURE.md` – high-level architecture & flows  
+- `INFRASTRUCTURE.md` – Terraform / Ansible / k3s / GCP VM  
+- `DEPLOYMENT.md` – CI/CD pipeline, environments, rollback  
+- `MONITORING.md` – Prometheus, Grafana, ServiceMonitor, alerts  
+- `APP.md` – FastAPI app, models, business logic  
+- `SECURITY.md` – secrets, auth, hardening  
+- `PRESENTATION_NOTES.md` – your extended speaking script
 
 ---
 
-## Architecture (Mermaid)
+## 1. What the app does (short story)
 
-```mermaid
-flowchart LR
-  subgraph Client
-    UI[Browser UI @ /] -->|POST /suggest| API
-    SWAGGER[/Swagger UI @ /docs/]
-  end
+The app is a **FastAPI-based music recommender**:
 
-  subgraph Service[FastAPI Service]
-    API[FastAPI\n/healthz /suggest /metrics]
-    YT[YouTube Client]
-    LLM[LLM Client\n(OpenAI-compatible)]
-    LOG[Structured Logging]
-    RL[Rate Limit (slowapi)]
-  end
+1. You type a **genre / mood / era / language** in a small web UI.
+2. The backend calls **YouTube Data API** to fetch candidate music videos.
+3. Candidates are sent to an **LLM running on the VM via Ollama** (OpenAI-compatible API).
+4. The LLM **re-ranks, deduplicates, and enriches** results with short reasons & tags.
+5. The UI shows **cards** with thumbnails, titles, channels and the reason text.
 
-  API --> RL
-  API --> YT
-  API --> LLM
-  API --> LOG
-  API -->|/metrics| PROM[Prometheus Scrape]
-
-  subgraph External
-    YTAPI[(YouTube Data API v3)]
-    OAI[(OpenAI / Ollama\nOpenAI-compatible API)]
-    GHCR[(GHCR Docker Registry)]
-  end
-
-  YT -->|candidates| YTAPI
-  LLM -->|rerank| OAI
-
-  subgraph Platform
-    K8s[Deployment + Service + Ingress]
-    CI[GitHub Actions CI]
-  end
-
-  CI --> GHCR
-  GHCR --> K8s
-  K8s --> Service
-  PROM[(Prometheus)] -->|scrape| API
-```
+It’s deployed on a **GCP VM** running **k3s**, fronted by **Traefik Ingress** with **cert-manager** TLS.
 
 ---
 
-## Requirements
+## 2. URLs you need for the live demo
 
-- Python 3.11+
-- **YouTube Data API v3** key
-- One of:
-  - **OpenAI** API key, or
-  - **Ollama** running locally (OpenAI-compatible) with a pulled model (e.g. `llama3.1:8b`)
+Assuming your static IP is `34.40.121.89` (current Terraform setup) and `sslip.io`:
+
+- **Staging app UI**  
+  `https://music-staging.34.40.121.89.sslip.io/`
+
+- **Production app UI**  
+  `https://music.34.40.121.89.sslip.io/`
+
+- **Grafana (monitoring dashboards)**  
+  `https://grafana.34.40.121.89.sslip.io/`
+
+> If you ever recreate the VM and change the IP, these hosts become:  
+> `music-staging.<NEW-IP>.sslip.io`, `music.<NEW-IP>.sslip.io`, `grafana.<NEW-IP>.sslip.io`.
 
 ---
 
-## Quickstart (Local)
+## 3. Getting the API Bearer token
 
-1. **Create virtualenv & install dependencies (using `uv venv`)**
+The app can be **locked behind an API token**. The token is injected from CI as `API_TOKEN`
+and stored in a Kubernetes Secret (`yt-llm-secrets`), then exposed as `API_TOKEN` env var
+in the `yt-llm` Deployment.
+
+You can get the value in two ways:
+
+### 3.1 From Kubernetes (VM shell)
+
+SSH into the VM:
 
 ```bash
-uv venv
-source .venv/bin/activate          # uv creates .venv by default
-pip install -r requirements.txt
+ssh -i ~/.ssh/yt-llm-k3s debian@34.40.121.89
 ```
 
-2. **Configure environment**
+Then:
 
 ```bash
-cp .env.example .env
-# Edit .env with your keys and options
-# Required: YOUTUBE_API_KEY
-# If using OpenAI cloud:
-#   LLM_PROVIDER=openai
-#   OPENAI_API_KEY=sk-...
-# If using local Ollama (OpenAI-compatible API):
-#   LLM_PROVIDER=openai
-#   OPENAI_BASE_URL=http://localhost:11434/v1
-#   OPENAI_API_KEY=ollama
-#   OPENAI_MODEL=llama3.1:8b
-# (optional) API_TOKEN=<random>  # if set, /suggest requires Bearer token
+# Production / music namespace
+sudo k3s kubectl -n music exec deploy/yt-llm -- printenv API_TOKEN
 ```
 
-> **Ollama setup (optional)**  
-> Install Ollama, then:
->
-> ```bash
-> ollama serve
-> ollama pull llama3.1:8b   # base model (not -instruct)
-> ```
->
-> Update `.env` as shown above.
+Copy the value (a long hex-like string). This is the **raw token**, *without* `Bearer` in front.
 
-3. **Run the API**
+### 3.2 From GitHub Secrets (CI/CD)
 
-```bash
-uvicorn app.main:app --reload --port 8020
-```
-
-4. **Try it**
-
-```bash
-# Health & metrics
-curl -sS http://localhost:8020/healthz
-curl -sS http://localhost:8020/metrics | head
-
-# Suggestions (with optional Bearer token if API_TOKEN is set)
-curl -sS -X POST http://localhost:8020/suggest \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_TOKEN" \
-  -d '{"genre":"lofi","mood":"chill","limit":3}' | jq .
-```
-
-5. **Open the tiny UI**  
-   Visit `http://localhost:8020/` in a browser.  
-   (If `API_TOKEN` is set, the page will prompt once and store it in `localStorage`.)
-
-6. **Swagger / OpenAPI client**
-
-- **Interactive docs (Swagger UI):** `http://localhost:8020/docs`  
-  You can execute the `POST /suggest` call right in the browser.  
-  Click **Authorize** and paste `Bearer <API_TOKEN>` if you enabled the token.
-- **OpenAPI JSON:** `http://localhost:8020/openapi.json`  
-  Import this into Postman/Insomnia/etc. to generate a client automatically.
+Alternatively, open the repo → **Settings → Secrets and variables → Actions** and find the
+`API_TOKEN` secret. That’s the same value used during deployment.
 
 ---
 
-## Configuration
+## 4. Using the GUI with the Bearer token
 
-All options can be set via environment variables (in `.env` locally, or injected in your platform):
+1. Open the **production UI** in your browser:
+   - `https://music.34.40.121.89.sslip.io/`
 
-| Variable           | Required              | Default       | Description                                                             |
-| ------------------ | --------------------- | ------------- | ----------------------------------------------------------------------- |
-| `YOUTUBE_API_KEY`  | **Yes**               | —             | YouTube Data API v3 key                                                 |
-| `LLM_PROVIDER`     | No                    | `openai`      | `openai` or `none` (bypass LLM re-rank)                                 |
-| `OPENAI_API_KEY`   | If using OpenAI cloud | —             | OpenAI key                                                              |
-| `OPENAI_BASE_URL`  | No                    | —             | Override OpenAI base URL (e.g., `http://localhost:11434/v1` for Ollama) |
-| `OPENAI_MODEL`     | No                    | `gpt-4o-mini` | OpenAI/Ollama model name (e.g., `llama3.1:8b`)                          |
-| `MAX_YT_RESULTS`   | No                    | `25`          | Size of the YouTube candidate set                                       |
-| `MAX_SUGGESTIONS`  | No                    | `10`          | Final number of suggestions returned                                    |
-| `REQUESTS_TIMEOUT` | No                    | `10`          | Outbound HTTP timeout (seconds)                                         |
-| `RATE_LIMIT`       | No                    | `10/minute`   | Per-IP rate limit for `/suggest`                                        |
-| `API_TOKEN`        | No                    | —             | If set, `/suggest` requires `Authorization: Bearer <token>`             |
+2. On first use, if `API_TOKEN` is set, the page will ask you for a token.
+   - Paste the **raw token** (e.g., `e57607...53805aa`) – **do not** type `Bearer` here.
+   - The UI stores it in `localStorage` and automatically sends:
+     ```http
+     Authorization: Bearer <your-token>
+     ```
+
+3. Fill the fields, for example:
+   - Genre: `lofi`
+   - Mood: `chill`
+   - Era: `any`
+   - Language: `en`
+   - Limit: `5`
+
+4. Click **“Suggest”**.
+
+✅ **Expected:** a list of cards with:
+- Thumbnail
+- Title + channel
+- Short description (“reason”)
+- Tags
+- Link to YouTube (opens in new tab)
+
+If the token is wrong or missing, you’ll see a 401 in the browser console or an error on screen.
 
 ---
 
-## API
+## 5. Happy-path curl tests (with positive responses)
 
-### `POST /suggest`
+Replace `PROD_HOST` / `STAGING_HOST` below with the real host when needed, for example:
 
-**Request**
+```bash
+export PROD_HOST="music.34.40.121.89.sslip.io"
+export STAGING_HOST="music-staging.34.40.121.89.sslip.io"
+export API_TOKEN="<paste token here>"
+```
+
+### 5.1 Health check
+
+```bash
+curl -k https://$PROD_HOST/healthz
+```
+
+✅ Expected (HTTP 200):
 
 ```json
-{
-  "genre": "rock",
-  "mood": "energetic",
-  "era": "90s",
-  "language": "en",
-  "limit": 10
-}
+{"status": "ok"}
 ```
 
-**Response**
+### 5.2 Metrics endpoint
+
+```bash
+curl -k https://$PROD_HOST/metrics | head
+```
+
+✅ Expected: a bunch of Prometheus metrics (`http_requests_total`, `process_cpu_seconds_total`, etc.).
+
+### 5.3 Suggest endpoint (authenticated)
+
+```bash
+curl -k -X POST "https://$PROD_HOST/suggest"       -H "Content-Type: application/json"       -H "Authorization: Bearer $API_TOKEN"       -d '{
+    "genre": "lofi",
+    "mood": "chill",
+    "era": "any",
+    "language": "en",
+    "limit": 3
+  }' | jq .
+```
+
+✅ Expected (HTTP 200): JSON like:
 
 ```json
 {
   "suggestions": [
     {
-      "title": "...",
-      "videoId": "...",
-      "channelTitle": "...",
-      "url": "https://www.youtube.com/watch?v=...",
-      "reason": "short LLM blurb",
-      "tags": ["mood", "energy", "subgenre"],
-      "publishedAt": "ISO8601"
+      "title": "…",
+      "videoId": "…",
+      "channelTitle": "…",
+      "url": "https://www.youtube.com/watch?v=…",
+      "reason": "short explanation from the LLM",
+      "tags": ["chill", "lofi", "instrumental"],
+      "publishedAt": "2024-01-01T00:00:00Z"
     }
   ],
-  "source_counts": { "youtube_candidates": 25, "llm_ranked": 10 }
+  "source_counts": {
+    "youtube_candidates": 25,
+    "llm_ranked": 3
+  }
 }
 ```
 
-### `GET /healthz`
-
-Liveness probe.
-
-### `GET /metrics`
-
-Prometheus metrics exposed by `prometheus_fastapi_instrumentator`.
-
-### `GET /docs`
-
-Swagger UI (interactive) — run API calls from your browser.
+If `LLM_PROVIDER` or Ollama is misconfigured, you’ll see a clear error message in the response,
+and logs in the pod will show context; for the demo, everything is wired to Ollama.
 
 ---
 
-## Docker
+## 6. Grafana – dashboards
 
-Build & run locally:
+URL:
+
+```text
+https://grafana.34.40.121.89.sslip.io/
+```
+
+### 6.1 Getting the Grafana admin password
+
+On the VM:
 
 ```bash
-docker build -t yt-llm-music-suggester:latest .
-docker run --rm \
-  -p 8020:8000 \  # map local 8020 -> container 8000
-  --env-file .env \
-  yt-llm-music-suggester:latest
+ssh -i ~/.ssh/yt-llm-k3s debian@34.40.121.89
+
+# Get password from the kube-prometheus-stack Secret
+sudo k3s kubectl -n monitoring get secret kps-grafana       -o jsonpath="{.data.admin-password}" | base64 -d; echo
 ```
 
-> ✅ Keeping `8020:8000` is correct here because the container listens on **8000**, and we expose it on **localhost:8020**.
+Default username is:
 
-Multi-arch image is published by CI to GHCR:
+```text
+admin
+```
 
-```
-ghcr.io/<owner>/yt-llm-music-suggester:latest
-```
+Use `admin` + the decoded password to log in.
+
+### 6.2 Useful dashboards for the demo
+
+Once inside Grafana (with Prometheus as the default datasource):
+
+- **Kubernetes / Compute Resources / Pods / Namespace “music”**
+  - Shows CPU/memory for the `yt-llm` pod.
+- **Kubernetes / Networking / Namespace “music”**
+  - Shows HTTP traffic and errors.
+- Custom dashboard (if you created one) using metrics like:
+  - `http_requests_total{path="/suggest"}`
+  - `process_cpu_seconds_total`
+  - `python_gc_objects_collected_total` (if exposed)
+
+For a quick graph while you demo:
+
+1. Click **“+ Create → Dashboard → Add a new panel”**.
+2. Query: `http_requests_total{handler="/suggest"}`.
+3. Set visualization to **Time series** and hit **Apply**.
+
+When you click “Suggest” in the UI during the demo, the graph should move.
 
 ---
 
-## Kubernetes (example)
+## 7. Alertmanager – viewing alerts
 
-**Prereqs**: a cluster (Docker Desktop k8s / k3s / GKE), and an ingress (e.g., Traefik or NGINX).  
-We ship example manifests in `k8s/`.
+Alertmanager is installed via **kube-prometheus-stack** but is **not exposed publicly**
+(to keep the attack surface small). You access it via `kubectl port-forward`.
 
-1. **Create ConfigMap & Secret** (or manage secrets your way)
+### 7.1 Get kubeconfig locally (once)
+
+On the VM:
 
 ```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.example.yaml  # edit or replace with your real Secret
+sudo cat /etc/rancher/k3s/k3s.yaml
 ```
 
-2. **Deploy service**
+Copy this file to your laptop as `k3s-kubeconfig.yaml`, then edit the `server:` line to use
+the VM’s external IP:
+
+```yaml
+server: https://34.40.121.89:6443
+```
+
+On your laptop:
 
 ```bash
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
+export KUBECONFIG=~/k3s-kubeconfig.yaml
+kubectl get nodes
+# should show: yt-llm-k3s Ready
 ```
 
-3. **Ingress**
+### 7.2 Port-forward Alertmanager
 
-- With **Traefik** + `sslip.io` host (e.g., `music.<EXTERNAL-IP>.sslip.io`):
+From your laptop (with `KUBECONFIG` set):
 
 ```bash
-kubectl apply -f k8s/ingress.yaml
+kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-alertmanager 9093:9093
 ```
 
-**Why `sslip.io`?**  
-`sslip.io` is a free wildcard DNS service that converts an IP address into a valid hostname (e.g., `34.40.121.89.sslip.io`).  
-This lets you test Ingress hosts **without buying a domain** or managing DNS records.
+Then open in your browser:
 
-- Works great for demos/POCs and local/k3s clusters.
-- When you’re ready for production, switch to your real domain and add TLS via cert‑manager + Let’s Encrypt.
-
-4. **Rollout / updates**
-
-- **Pin by digest** (recommended on Apple Silicon):
-
-```bash
-kubectl -n music set image deploy/yt-llm \
-  api=ghcr.io/<owner>/yt-llm-music-suggester@sha256:<arm64_or_amd64_digest>
-kubectl -n music rollout status deploy/yt-llm
+```text
+http://localhost:9093/
 ```
 
-- Or use `:latest` and set `imagePullPolicy: Always` for the container.
+✅ Expected: Alertmanager UI showing “No alerts firing” under normal conditions.
+
+You can trigger sample alerts (e.g., by killing the `yt-llm` pod or increasing resource
+usage) – see `MONITORING.md` if you want explicit steps.
 
 ---
 
-## Monitoring
+## 8. Where to find more details
 
-- `/metrics` endpoint ready for Prometheus scraping.
-- `/healthz` wired as liveness/readiness probes in the Deployment.
-- Add a ServiceMonitor (if running the Prometheus Operator) and a Grafana dashboard if desired.
+- **Architecture, flows, sequence diagrams:** `ARCHITECTURE.md`
+- **VM, k3s, Terraform, Ansible:** `INFRASTRUCTURE.md`
+- **CI/CD, jobs, rollback strategy:** `DEPLOYMENT.md`
+- **App internals & API schema:** `APP.md`
+- **Monitoring stack & alert rules:** `MONITORING.md`
+- **Security model & hardening:** `SECURITY.md`
+- **Your speaking script:** `PRESENTATION_NOTES.md`
 
----
+For the actual **live demo**, you can almost entirely drive from this README:
 
-## CI (GitHub Actions)
-
-- **build-test** job: installs deps, caches pip, runs tests.
-- **docker** job: builds **multi-arch** image (amd64 & arm64) using Buildx + QEMU, pushes to GHCR with:
-  - `:latest`
-  - `:${{ github.sha }}`
-- Workflow permissions:
-  - `contents: read`, `packages: write` (for GHCR push)
-
-> Optional future CD: patch the deployment to the `${{ github.sha }}` tag automatically after a successful build.
-
----
-
-## Terraform & Ansible (GCP)
-
-- **Terraform** (`infra/terraform`): minimal GCE VM + firewall + static IP (stop resources when not in use to control costs).
-- **Ansible** (`infra/ansible`): installs **k3s** on the VM, waits for node ready, applies app manifests & ingress.  
-  If the cluster is slow to serve the OpenAPI schema, `--validate=false` can help apply manifests reliably.
-
-> To save money, you can pause cloud infra. We used it to verify a real cloud path, but local k8s + GHCR is enough for the demo.
-
----
-
-## Security
-
-- No secrets in the repo; use `.env` locally and **Kubernetes Secrets/CI secrets** in environments.
-- Optional `API_TOKEN` enforces Bearer auth on `/suggest`.
-- Container uses minimal base (Python slim) via multi-stage build.
-
----
-
-## Testing
-
-```bash
-pytest -q
-```
-
----
-
-## Troubleshooting
-
-- **429 / insufficient_quota** from OpenAI: set `LLM_PROVIDER=none` for demos, or use local **Ollama** with `OPENAI_BASE_URL`.
-- **K8s doesn’t pull latest image**: If using `:latest`, add `imagePullPolicy: Always`, or pin by **digest**.
-- **Image platform mismatch** on Apple Silicon: ensure the registry has **arm64** manifest (CI pushes multi-arch).
-- **Ingress 404**: Confirm ingress class/annotations match your controller (Traefik vs NGINX). Verify `host` + DNS (or `sslip.io` domain).
-
----
-
-## Demo Script (2–3 minutes)
-
-1. Open `http://localhost:8020/` (or your Ingress host).
-2. Enter: `genre=lofi`, `mood=chill`, `limit=5` → **Suggest**.
-3. Show result cards: titles, thumbnails, channels, “reason”, links open YouTube.
-4. `curl` `/healthz` and `/metrics` to demo readiness & observability.
-5. Mention rate limiting, token auth, CI pipeline, and k8s rollout with digest pinning.
-
----
-
-## Project Checklist Status
-
-- **Web app (FE/BE)** ✅ (FastAPI + tiny UI)
-- **Backend API** ✅ (`/healthz`, `/suggest`, `/metrics` + Swagger `/docs`)
-- **Database** ➖ (not required)
-- **Auth** ✅ (optional Bearer token)
-- **LLM integration** ✅ (OpenAI or Ollama; using model `llama3.1:8b` in local mode)
-- **Error handling** ✅ (retries/fallbacks)
-- **Rate limiting & costs** ✅
-- **Public accessibility** ✅ (Ingress + `sslip.io`)
-- **HTTPS** 🟡 (cert-manager template ready; not enabled)
-- **Domain/DNS** 🟡 (`sslip.io` used; custom domain optional)
-- **Code quality** ✅
-- **Tests** ✅
-- **Git workflow / PRs** ✅
-- **Docker** ✅ (multi-stage)
-- **Kubernetes** ✅ (manifests + probes + resources)
-- **IaC (Terraform)** ✅ (GCE VM + firewall + IP)
-- **Ansible** ✅ (K3s install & apply)
-- **CI/CD** ✅ (CI builds/pushes; CD manual via kubectl; can automate)
-- **Rollback** ✅ (`kubectl rollout undo`)
-- **Observability** ✅ (metrics + healthz; dashboards optional)
-- **Security practices** ✅ (secrets handling, minimal image)
-- **Docs** ✅ (this README)
-- **Presentation** 🟡 (slides optional; demo script above)
-
----
-
-## License
-
-MIT (or your preferred license)
+1. Show the **GUI**, do a successful suggestion with visible cards.  
+2. Show **curl /healthz** and **curl /suggest** with Bearer.  
+3. Jump into **Grafana**, show a graph moving when you hit `/suggest`.  
+4. Optionally show **Alertmanager** UI via port-forward.
