@@ -113,6 +113,16 @@
         state: started
       tags: [ollama]
 
+    - name: Ensure Ollama config directory exists
+      when: enable_ollama | bool
+      file:
+        path: /etc/ollama
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: [ollama]
+
     - name: Configure Ollama resource limits
       when: enable_ollama | bool
       copy:
@@ -477,7 +487,7 @@
           kind: Ingress
           metadata:
             name: yt-llm-ing
-            namespace: {{ k8s_ns }}
+            namespace: {{ k8s_ns }} }
             annotations:
               kubernetes.io/ingress.class: "traefik"
               cert-manager.io/cluster-issuer: "{{ issuer_name }}"
